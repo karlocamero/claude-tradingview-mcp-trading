@@ -1,50 +1,78 @@
 {
-  "watchlist": ["BTCUSDT"],
-  "default_timeframe": "1m",
+  "watchlist": ["BTCUSD", "SOLUSD", "HUSD", "ZECUSD", "MUSD", "NIGHTUSD", "RENDERUSD"],
+  "default_timeframe": "4H",
+
+  "allow_shorts": false,
 
   "strategy": {
-    "name": "VWAP + RSI(3) + EMA(8) Scalping Strategy",
-    "sources": ["Lewis Jackson"],
-    "description": "Three indicators, each doing a different job. EMA(8) for trend direction, VWAP for session bias, RSI(3) for entry timing. All three must align before a trade fires."
+    "name": "EMA Pullback Strategy (4H)",
+    "description": "EMA 8/20/50/200 defines trend structure. Price must pull back to EMA 20 in a healthy uptrend. Entry on a bullish reversal candle with volume confirmation. Risk never exceeds 1% of account."
   },
 
   "indicators": {
-    "ema_8": "Trend direction. Price above EMA(8) = bullish momentum. Below = bearish.",
-    "vwap": "Session bias. Price above VWAP = buyers in control. Below = sellers. Resets at midnight UTC.",
-    "rsi_3": "Entry timing. RSI on 3 candles only — extremely sensitive. Below 30 in an uptrend = snap-back setup. Above 70 in a downtrend = reversal likely."
+    "ema_8":   "Fast trend. TP2 trailing stop — trail remaining position under EMA 8.",
+    "ema_20":  "Pullback target. Entry zone. Exit if 4H candle closes below EMA 20.",
+    "ema_50":  "Mid-term trend. Part of EMA stack ordering check.",
+    "ema_200": "Macro trend filter. Price above = bull market only."
   },
 
-  "bias_criteria": {
-    "bullish": ["Price is above VWAP", "Price is above EMA(8)"],
-    "bearish": ["Price is below VWAP", "Price is below EMA(8)"]
-  },
-
-  "entry_rules": {
-    "long": [
-      "Price is above VWAP — buyers in control for the session",
-      "Price is above EMA(8) — uptrend confirmed",
-      "RSI(3) has dropped below 30 — short-term pullback in an uptrend, snap-back likely"
-    ],
-    "short": [
-      "Price is below VWAP — sellers in control",
-      "Price is below EMA(8) — downtrend confirmed",
-      "RSI(3) has spiked above 70 — overbought in a downtrend, reversal likely"
-    ]
-  },
-
-  "exit_rules": [
-    "Exit when RSI(3) crosses back above 50 (for longs) or below 50 (for shorts)",
-    "Hard stop: 0.3% below entry for longs, 0.3% above entry for shorts",
-    "Take profit at next VWAP touch or EMA(8) cross"
+  "trend_filter": [
+    "Price MUST be above EMA 200",
+    "EMA stack MUST be ordered: EMA 8 > EMA 20 > EMA 50 > EMA 200",
+    "All EMAs MUST be sloping upward",
+    "Tangled / flat / crossing EMAs = ranging market → NO TRADE"
   ],
+
+  "pullback_conditions": [
+    "Price MUST touch or come within 1% of EMA 20",
+    "Pullback depth MUST be 5%–15% from the most recent swing high",
+    "Pullback duration MUST be 3–7 candles (4H)",
+    "Price breaking through EMA 20 toward EMA 50 → NO TRADE (trend weakening)"
+  ],
+
+  "entry_trigger": [
+    "Bullish engulfing: green body fully covers prior red body",
+    "Hammer: small body at top, lower wick ≥ 2× body size",
+    "Shakeout: candle dips below EMA 20 but closes back above it",
+    "NEVER enter on the red pullback candle — wait for reversal candle to CLOSE"
+  ],
+
+  "volume_confirmation": [
+    "Volume on reversal candle MUST be higher than avg volume of pullback candles",
+    "Flat or declining volume on reversal → NO TRADE"
+  ],
+
+  "position_sizing": {
+    "max_risk_per_trade": "1% of account balance",
+    "formula": "Position size = (Account × 1%) ÷ stop-loss distance %",
+    "stop_placement": "Just below the swing low of the pullback",
+    "cap": "Also capped by MAX_TRADE_SIZE_USD in .env"
+  },
+
+  "exit_rules": {
+    "tp1": {
+      "target": "Entry + 2× risk in price terms",
+      "action": "Close 50% of position",
+      "stop_action": "Remaining 50% now trails under EMA 8"
+    },
+    "tp2": {
+      "target": "Trail stop just below EMA 8 on 4H chart",
+      "action": "Exit remaining 50% when price closes below EMA 8 trail"
+    },
+    "stop_loss": {
+      "initial": "Just below pullback swing low",
+      "exit_rules": [
+        "Rule 19: 4H candle closes below EMA 20 after entry → full exit",
+        "Rule 20: EMA 8 crosses below EMA 20 → full exit",
+        "Rule 21: Price closes below original stop loss → full exit"
+      ]
+    }
+  },
 
   "risk_rules": [
-    "Risk maximum 1% of portfolio per trade",
-    "Maximum trade size capped by MAX_TRADE_SIZE_USD in .env",
-    "Maximum trades per day capped by MAX_TRADES_PER_DAY in .env",
-    "Do not trade if price is more than 1.5% away from VWAP — overextended",
-    "Paper trade first — validate this strategy on your specific asset before going live"
-  ],
-
-  "notes": "Scalping strategy — designed for 1m to 5m timeframes. RSI(3) is intentionally fast and sensitive. Do not apply to higher timeframes."
+    "NEVER risk more than 1% of account per trade",
+    "NEVER enter mid-candle — signal valid only after 4H candle CLOSES",
+    "NEVER trade if any trend filter condition fails",
+    "Paper trade first — validate with PAPER_TRADING=true before going live"
+  ]
 }

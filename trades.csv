@@ -1,2 +1,9 @@
 Date,Time (UTC),Exchange,Symbol,Side,Quantity,Price,Total USD,Fee (est.),Net Amount,Order ID,Mode,Notes
-,,,,,,,,,,,"NOTE","Hey, if you're at this stage of the video, you must be enjoying it... perhaps you could hit subscribe now? :)"
+,,,,,,,,,,,NOTE,"Hey, if you're at this stage of the video, you must be enjoying it... perhaps you could hit subscribe now? :)"
+2026-04-25,00:40:33,Kraken,BTCUSD,buy,,77403.0000,,,,BLOCKED,BLOCKED,"Failed: MACD bullish divergence (price lower low, MACD higher low); RSI(14) below 50 and rising (momentum turning up)"
+2026-04-25,00:40:33,Kraken,SOLUSD,buy,,86.2000,,,,BLOCKED,BLOCKED,"Failed: MACD bullish divergence (price lower low, MACD higher low)"
+2026-04-25,00:40:34,Kraken,HUSD,buy,,0.1392,,,,BLOCKED,BLOCKED,"Failed: Price pulled back to EMA 21 or EMA 50 (within 2%); MACD bullish divergence (price lower low, MACD higher low); RSI(14) below 50 and rising (momentum turning up)"
+2026-04-25,00:40:34,Kraken,ZECUSD,buy,,357.0500,,,,BLOCKED,BLOCKED,"Failed: Price pulled back to EMA 21 or EMA 50 (within 2%); MACD bullish divergence (price lower low, MACD higher low); RSI(14) below 50 and rising (momentum turning up)"
+2026-04-25,00:40:34,Kraken,MUSD,buy,,4.3588,,,,BLOCKED,BLOCKED,"Failed: MACD bullish divergence (price lower low, MACD higher low); RSI(14) below 50 and rising (momentum turning up)"
+2026-04-25,00:40:34,Kraken,NIGHTUSD,buy,,0.0374,,,,BLOCKED,BLOCKED,"Failed: Price above EMA 200 (macro bull market); MACD bullish divergence (price lower low, MACD higher low); RSI(14) below 50 and rising (momentum turning up)"
+2026-04-25,00:40:34,Kraken,RENDERUSD,buy,,1.7890,,,,BLOCKED,BLOCKED,"Failed: Price above EMA 200 (macro bull market); MACD bullish divergence (price lower low, MACD higher low); RSI(14) below 50 and rising (momentum turning up)"

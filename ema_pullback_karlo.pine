@@ -1,0 +1,174 @@
+//@version=6
+strategy("EMA Pullback with Karlo",
+         overlay          = true,
+         initial_capital  = 1000,
+         currency         = currency.USD,
+         default_qty_type = strategy.cash,
+         default_qty_value= 100,
+         commission_type  = strategy.commission.percent,
+         commission_value = 0.4,
+         max_bars_back    = 500,
+         pyramiding       = 0)
+
+// ── Inputs ────────────────────────────────────────────────────────────────────
+i_slopeLB  = input.int(5,     "EMA Slope Lookback (bars)", group="EMAs")
+i_riskPct  = input.float(1.0, "Risk % per Trade",          group="Risk")
+i_tp1Mult  = input.float(2.0, "TP1 Multiplier (× risk)",   group="Risk")
+i_maxUSD   = input.float(100, "Max Trade Size (USD)",       group="Risk")
+i_minDepth = input.float(5.0, "Min Pullback Depth %",       group="Pullback")
+i_maxDepth = input.float(15.0,"Max Pullback Depth %",       group="Pullback")
+i_minDur   = input.int(3,     "Min Pullback Duration",      group="Pullback")
+i_maxDur   = input.int(7,     "Max Pullback Duration",      group="Pullback")
+
+// ── EMAs ─────────────────────────────────────────────────────────────────────
+ema8   = ta.ema(close, 8)
+ema20  = ta.ema(close, 20)
+ema50  = ta.ema(close, 50)
+ema200 = ta.ema(close, 200)
+
+plot(ema8,   "EMA 8",   color=color.new(color.yellow, 0), linewidth=1)
+plot(ema20,  "EMA 20",  color=color.new(color.blue,   0), linewidth=2)
+plot(ema50,  "EMA 50",  color=color.new(color.orange, 0), linewidth=2)
+plot(ema200, "EMA 200", color=color.new(color.red,    0), linewidth=3)
+
+// ── Trend Filter ──────────────────────────────────────────────────────────────
+// All 4 conditions from rules.json: price > EMA200, stack ordered, all sloping up
+trendOk = close > ema200 and
+          ema8 > ema20 and ema20 > ema50 and ema50 > ema200 and
+          ema8   > ema8  [i_slopeLB] and
+          ema20  > ema20 [i_slopeLB] and
+          ema50  > ema50 [i_slopeLB] and
+          ema200 > ema200[i_slopeLB]
+
+// ── Swing High Search (local max in bars 3–25 ago) ───────────────────────────
+// Matches bot.js analyzePullback: exclude last 3 candles, look back up to 25
+sh_price_cur = float(na)
+sh_dur_cur   = 0
+for i = 3 to 25
+    if close[i] > close[i - 1] and close[i] > close[i + 1]
+        sh_price_cur := close[i]
+        sh_dur_cur   := i
+        break
+
+sh_found     = not na(sh_price_cur)
+pb_depth_cur = sh_found ? (sh_price_cur - close) / sh_price_cur * 100 : float(na)
+
+// ── Pullback Scan (swing high → current bar) ──────────────────────────────────
+// Matches bot.js: swing low, trend intact (no close < EMA20*0.99 excl. current bar),
+// EMA 20 touch (within 1% or wick below EMA20)
+pb_swing_low_cur   = float(na)
+pb_trend_ok_cur    = true
+pb_touched_e20_cur = false
+
+if sh_found
+    for i = 0 to sh_dur_cur - 1
+        if na(pb_swing_low_cur) or low[i] < pb_swing_low_cur
+            pb_swing_low_cur := low[i]
+        if i > 0 and close[i] < ema20[i] * 0.99
+            pb_trend_ok_cur := false
+        dist = math.abs((close[i] - ema20[i]) / ema20[i]) * 100
+        if dist <= 1.0 or low[i] <= ema20[i]
+            pb_touched_e20_cur := true
+
+// ── Price at EMA 20 (Rule 5: within 1%) ──────────────────────────────────────
+priceAtEma20 = math.abs((close - ema20) / ema20) * 100 <= 1.0
+
+// ── Reversal Candle Detection ─────────────────────────────────────────────────
+// Matches bot.js detectReversalCandle: engulfing, hammer, shakeout
+body      = math.abs(close - open)
+range_    = high - low
+lowerWick = math.min(open, close) - low
+upperWick = high - math.max(open, close)
+
+isEngulfing = close > open and close[1] < open[1] and
+              open < close[1] and close > open[1]
+
+isHammer    = range_ > 0 and body > 0 and
+              (body / range_) <= 0.35 and
+              lowerWick >= 2 * body and
+              upperWick <= body
+
+isShakeout  = low < ema20 and close > ema20
+
+isReversal  = isEngulfing or isHammer or isShakeout
+
+// ── Volume Confirmation (Rule 11) ─────────────────────────────────────────────
+// Reversal candle volume > avg volume of the pullback candles
+pb_avg_vol = float(na)
+if sh_found and sh_dur_cur >= 1
+    total_vol = 0.0
+    for i = 1 to sh_dur_cur
+        total_vol += volume[i]
+    pb_avg_vol := total_vol / sh_dur_cur
+
+volOk = sh_found and not na(pb_avg_vol) and volume > pb_avg_vol
+
+// ── Entry Signal (all 9 conditions) ──────────────────────────────────────────
+durationOk = sh_found and sh_dur_cur >= i_minDur and sh_dur_cur <= i_maxDur
+depthOk    = sh_found and not na(pb_depth_cur) and
+             pb_depth_cur >= i_minDepth and pb_depth_cur <= i_maxDepth
+
+entrySignal = trendOk            and  // trend filter (rules 1-3)
+              priceAtEma20       and  // rule 5: price at EMA 20
+              depthOk            and  // rule 6: pullback depth 5-15%
+              durationOk         and  // rule 7: pullback duration 3-7 candles
+              pb_trend_ok_cur    and  // rule 8: no break below EMA 20
+              pb_touched_e20_cur and  // EMA 20 was actually touched
+              isReversal         and  // rules 9-10: reversal candle
+              volOk              and  // rule 11: volume confirmation
+              strategy.position_size == 0
+
+// ── Position Sizing (rules 13-16) ────────────────────────────────────────────
+// Stop just below pullback swing low × 0.999
+// Risk = 1% of equity; position size = risk ÷ stop distance; cap at maxUSD
+stopLevel = sh_found and not na(pb_swing_low_cur) ?
+            pb_swing_low_cur * 0.999 : close * 0.95
+stopDist  = math.max(close - stopLevel, close * 0.0001)
+riskUSD   = strategy.equity * (i_riskPct / 100)
+posUSD    = math.min(riskUSD / (stopDist / close), i_maxUSD)
+qty_btc   = posUSD / close
+tp1Level  = close + i_tp1Mult * stopDist  // rule 17: entry + 2× risk
+
+// ── Position State ────────────────────────────────────────────────────────────
+var float pos_stop = na
+var float pos_tp1  = na
+var bool  tp1_hit  = false
+
+// ── Entry ─────────────────────────────────────────────────────────────────────
+if entrySignal
+    pos_stop := stopLevel
+    pos_tp1  := tp1Level
+    tp1_hit  := false
+    strategy.entry("Long", strategy.long, qty=qty_btc, comment="EMA Pullback")
+
+// ── Exit Logic ────────────────────────────────────────────────────────────────
+// Priority: protective stops first, then take-profit targets
+if strategy.position_size > 0
+    if close < ema20
+        strategy.close("Long", comment="R19: Close < EMA20")     // rule 19
+    else if ta.crossunder(ema8, ema20)
+        strategy.close("Long", comment="R20: EMA8 x EMA20")      // rule 20
+    else if close <= pos_stop
+        strategy.close("Long", comment="R21: Stop Loss")          // rule 21
+    else if not tp1_hit and close >= pos_tp1
+        strategy.close("Long", qty_percent=50, comment="TP1 50%") // rule 17: close 50%
+        tp1_hit := true
+    else if tp1_hit and close <= ema8 * 0.999
+        strategy.close("Long", comment="TP2 EMA8 Trail")          // rule 18: trail under EMA 8
+
+// Reset state when position closes
+if strategy.position_size == 0 and strategy.position_size[1] > 0
+    pos_stop := na
+    pos_tp1  := na
+    tp1_hit  := false
+
+// ── Visual Signals ────────────────────────────────────────────────────────────
+plotshape(entrySignal, "Entry Signal", shape.triangleup,
+          location.belowbar, color.new(color.green, 0), size=size.small)
+
+plot(strategy.position_size > 0 ? pos_stop     : na,
+     "Stop",      color.red,    linewidth=1, style=plot.style_linebr)
+plot(strategy.position_size > 0 ? pos_tp1      : na,
+     "TP1",       color.green,  linewidth=1, style=plot.style_linebr)
+plot(strategy.position_size > 0 ? ema8 * 0.999 : na,
+     "TP2 Trail", color.yellow, linewidth=1, style=plot.style_linebr)
