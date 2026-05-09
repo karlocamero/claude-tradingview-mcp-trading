@@ -1,5 +1,5 @@
 {
-  "watchlist": ["BTCUSD", "SOLUSD", "HUSD", "ZECUSD", "MUSD", "NIGHTUSD", "RENDERUSD"],
+  "watchlist": ["BTCUSD"],
   "default_timeframe": "4H",
 
   "allow_shorts": false,

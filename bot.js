@@ -1,8 +1,9 @@
 /**
  * Claude + TradingView MCP — Automated Trading Bot
  *
- * Strategy: EMA Pullback Strategy (4H)
- * EMAs 8/20/50/200 — trend filter, pullback detection, reversal trigger, volume confirmation.
+ * Strategy: EMA Pullback Speed Strategy (PakunFX) — 4H
+ * Dynamic adaptive EMA + EMA 21/50 trend filter, candle pattern + speed entry,
+ * ATR-based stop loss, fixed-% take profit.
  *
  * Local mode:  node bot.js
  * Cloud mode:  Railway cron — 0 *\/4 * * *
@@ -33,6 +34,19 @@ function checkOnboarding() {
         "MAX_TRADES_PER_DAY=3",
         "PAPER_TRADING=true",
         "TIMEFRAME=4H",
+        "ALLOW_SHORTS=false",
+        "",
+        "# PakunFX Strategy params (defaults match Pine Script)",
+        "DYN_EMA_MAX_LENGTH=50",
+        "ACCEL_MULTIPLIER=3.0",
+        "RETURN_THRESHOLD=5.0",
+        "ATR_LENGTH=14",
+        "ATR_MULT=4.0",
+        "FIXED_TP_PCT=3.0",
+        "SHORT_EMA_LEN=21",
+        "LONG_EMA_LEN=50",
+        "LONG_SPEED_MIN=1000",
+        "SHORT_SPEED_MAX=-1000",
         "",
         "# Google Sheets (required for Railway — trades + position persistence)",
         "GOOGLE_SHEET_ID=",
@@ -56,6 +70,19 @@ const CONFIG = {
   maxTradeSizeUSD: parseFloat(process.env.MAX_TRADE_SIZE_USD  || "100"),
   maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY    || "3"),
   paperTrading:    process.env.PAPER_TRADING !== "false",
+  allowShorts:     process.env.ALLOW_SHORTS === "true",
+  strategy: {
+    maxLength:       parseInt(process.env.DYN_EMA_MAX_LENGTH || "50"),
+    accelMultiplier: parseFloat(process.env.ACCEL_MULTIPLIER  || "3.0"),
+    returnThreshold: parseFloat(process.env.RETURN_THRESHOLD  || "5.0"),
+    atrLength:       parseInt(process.env.ATR_LENGTH          || "14"),
+    atrMult:         parseFloat(process.env.ATR_MULT          || "4.0"),
+    fixedTpPct:      parseFloat(process.env.FIXED_TP_PCT      || "1.5"),
+    shortEmaLen:     parseInt(process.env.SHORT_EMA_LEN       || "21"),
+    longEmaLen:      parseInt(process.env.LONG_EMA_LEN        || "50"),
+    longSpeedMin:    parseFloat(process.env.LONG_SPEED_MIN    || "1000"),
+    shortSpeedMax:   parseFloat(process.env.SHORT_SPEED_MAX   || "-1000"),
+  },
   kraken: {
     apiKey:    process.env.KRAKEN_API_KEY,
     secretKey: process.env.KRAKEN_SECRET_KEY,
@@ -200,136 +227,72 @@ function calcEMA(closes, period) {
   return ema;
 }
 
-// Full EMA series aligned 1:1 with closes (null for warmup candles)
-function calcEMASeriesFull(closes, period) {
-  if (closes.length < period) return closes.map(() => null);
-  const k = 2 / (period + 1);
-  let ema = closes.slice(0, period).reduce((a, b) => a + b, 0) / period;
-  const result = new Array(period - 1).fill(null);
-  result.push(ema);
-  for (let i = period; i < closes.length; i++) {
-    ema = closes[i] * k + ema * (1 - k);
-    result.push(ema);
+// Dynamic adaptive EMA — matches PakunFX Pine Script logic exactly.
+// Length shortens when price accelerates; lengthens when price is near recent highs.
+function calcDynamicEMAFull(candles, maxLength = 50, accelMultiplier = 3.0) {
+  const closes = candles.map((c) => c.close);
+  const n = closes.length;
+  const result = [];
+  let dynEma = null;
+
+  for (let i = 0; i < n; i++) {
+    const wStart = Math.max(0, i - 199);
+    const window  = closes.slice(wStart, i + 1);
+
+    // Normalise current close within its 200-bar range (0.5 – 1.0)
+    const maxClose        = Math.max(...window);
+    const countsDiffNorm  = maxClose === 0 ? 0.5 : (closes[i] + maxClose) / (2 * maxClose);
+    const dynLength       = 5 + countsDiffNorm * (maxLength - 5);
+
+    // Acceleration factor: how fast price is changing vs its own recent history
+    const deltas = [];
+    for (let j = Math.max(1, wStart); j <= i; j++) {
+      deltas.push(Math.abs(closes[j] - closes[j - 1]));
+    }
+    const delta      = i > 0 ? Math.abs(closes[i] - closes[i - 1]) : 0;
+    const maxDelta   = deltas.length > 0 ? Math.max(...deltas) : 1;
+    const accelFactor = maxDelta === 0 ? 0 : delta / maxDelta;
+
+    const alphaBase = 2 / (dynLength + 1);
+    const alpha     = Math.min(1, alphaBase * (1 + accelFactor * accelMultiplier));
+
+    dynEma = dynEma === null ? closes[i] : alpha * closes[i] + (1 - alpha) * dynEma;
+    result.push(dynEma);
   }
+
   return result;
 }
 
-// True if EMA value now is higher than it was slopeLookback candles ago
-function isEMASloping(closes, period, slopeLookback = 5) {
-  if (closes.length < period + slopeLookback) return false;
-  const recent = calcEMA(closes, period);
-  const prev   = calcEMA(closes.slice(0, -slopeLookback), period);
-  return recent !== null && prev !== null && recent > prev;
-}
-
-// ─── Pullback Analysis ────────────────────────────────────────────────────────
-
-// Returns all pullback measurements regardless of validity so each condition
-// can be displayed and checked independently in the safety check.
-function analyzePullback(candles, ema20Series) {
-  const closes  = candles.map((c) => c.close);
-  const n       = closes.length;
-  const lastIdx = n - 1;
-
-  // Most recent swing high — simple local max, exclude last 3 candles
-  let swingHighIdx   = -1;
-  let swingHighPrice = null;
-  for (let i = lastIdx - 3; i >= Math.max(1, lastIdx - 25); i--) {
-    if (closes[i] > closes[i - 1] && closes[i] > closes[i + 1]) {
-      swingHighIdx   = i;
-      swingHighPrice = closes[i];
-      break;
-    }
-  }
-
-  const currentPrice = closes[lastIdx];
-  const duration     = swingHighIdx >= 0 ? lastIdx - swingHighIdx : null;
-  const depth        = swingHighPrice ? ((swingHighPrice - currentPrice) / swingHighPrice) * 100 : null;
-
-  let trendIntact  = true;
-  let touchedEMA20 = false;
-  let swingLow     = swingHighIdx >= 0 ? Infinity : null;
-
-  if (swingHighIdx >= 0) {
-    for (let i = swingHighIdx + 1; i <= lastIdx; i++) {
-      if (candles[i].low < swingLow) swingLow = candles[i].low;
-      const e20 = ema20Series[i];
-      if (!e20) continue;
-      // Check for breakdown (only on non-reversal pullback candles)
-      if (i < lastIdx && closes[i] < e20 * 0.99) trendIntact = false;
-      // Touch check: close within 1% OR wick touches EMA
-      const distPct = Math.abs((candles[i].close - e20) / e20) * 100;
-      if (distPct <= 1.0 || candles[i].low <= e20) touchedEMA20 = true;
-    }
-    if (swingLow === Infinity) swingLow = null;
-  }
-
-  return {
-    swingHighIdx,
-    swingHighPrice,
-    swingLow,
-    duration,
-    depth,
-    trendIntact,
-    touchedEMA20,
-    durationValid: duration !== null && duration >= 3 && duration <= 7,
-    depthValid:    depth !== null && depth >= 5 && depth <= 15,
-  };
-}
-
-// ─── Reversal Candle Detection ────────────────────────────────────────────────
-
-function detectReversalCandle(candles, ema20Series) {
-  const n    = candles.length;
-  if (n < 2) return { detected: false };
-  const curr = candles[n - 1];
-  const prev = candles[n - 2];
-  const e20  = ema20Series[n - 1];
-  if (!e20) return { detected: false };
-
-  const currGreen = curr.close > curr.open;
-  const prevRed   = prev.close < prev.open;
-  const body      = Math.abs(curr.close - curr.open);
-  const range     = curr.high - curr.low;
-  const lowerWick = Math.min(curr.open, curr.close) - curr.low;
-  const upperWick = curr.high - Math.max(curr.open, curr.close);
-
-  // Bullish engulfing: green body fully covers prior red body
-  if (currGreen && prevRed && curr.open < prev.close && curr.close > prev.open) {
-    return { detected: true, type: "bullish engulfing" };
-  }
-
-  // Hammer: small body (≤35% of range), lower wick ≥2× body, tiny upper wick
-  if (range > 0 && body > 0 && body / range <= 0.35 && lowerWick >= 2 * body && upperWick <= body) {
-    return { detected: true, type: "hammer" };
-  }
-
-  // Shakeout: wick dipped below EMA 20 but candle closed back above it
-  if (curr.low < e20 && curr.close > e20) {
-    return { detected: true, type: "shakeout" };
-  }
-
-  return { detected: false };
-}
-
-// ─── Volume Confirmation ──────────────────────────────────────────────────────
-
-function checkVolumeConfirmation(candles, pullbackDuration) {
+// ATR using Wilder's RMA (matches ta.atr in Pine Script)
+function calcATRFull(candles, period = 14) {
   const n = candles.length;
-  if (pullbackDuration < 1 || n < pullbackDuration + 1) {
-    return { passes: false, reversalVol: 0, avgPullbackVol: 0 };
+  const result = new Array(n).fill(null);
+  const k = 1 / period;
+  let rma = null;
+
+  for (let i = 1; i < n; i++) {
+    const tr = Math.max(
+      candles[i].high - candles[i].low,
+      Math.abs(candles[i].high - candles[i - 1].close),
+      Math.abs(candles[i].low  - candles[i - 1].close),
+    );
+    rma = rma === null ? tr : tr * k + rma * (1 - k);
+    result[i] = rma;
   }
-  const pbCandles    = candles.slice(n - 1 - pullbackDuration, n - 1);
-  const avgPullbackVol = pbCandles.reduce((s, c) => s + c.volume, 0) / pbCandles.length;
-  const reversalVol  = candles[n - 1].volume;
-  return { passes: reversalVol > avgPullbackVol, reversalVol, avgPullbackVol };
+
+  return result;
 }
 
-// ─── Safety Check — 9 explicit conditions covering all 11 strategy rules ──────
+// ─── Safety Check — PakunFX strategy conditions ───────────────────────────────
 
-function runSafetyCheck(candles, price, ema8, ema20, ema50, ema200, ema20Series) {
+function runSafetyCheck(candles, price, emaShort, emaLong, dynEmaFull, atrFull) {
   const results = [];
-  const closes  = candles.map((c) => c.close);
+  const n       = candles.length;
+  const dynEma  = dynEmaFull[n - 1];
+  const atr     = atrFull[n - 1];
+  const s       = CONFIG.strategy;
+
+  if (!dynEma || !atr) return { results, allPass: false, direction: null };
 
   const check = (label, required, actual, pass) => {
     results.push({ label, required, actual, pass });
@@ -337,183 +300,145 @@ function runSafetyCheck(candles, price, ema8, ema20, ema50, ema200, ema20Series)
     console.log(`     Required: ${required} | Actual: ${actual}`);
   };
 
+  // Speed = candle body in USD (close − open)
+  const curr     = candles[n - 1];
+  const prev1    = candles[n - 2];
+  const prev2    = candles[n - 3];
+  const speed    = curr.close - curr.open;
+  const distance = Math.abs(price - dynEma) / dynEma * 100;
+
+  // Candle pattern: two consecutive green candles then current breaks above prior high
+  const bullishReversal = (
+    prev2.close > prev2.open &&
+    prev1.close > prev1.open &&
+    price > prev1.high
+  );
+
+  // Candle pattern: two consecutive red candles then current breaks below prior low
+  const bearishReversal = (
+    prev2.close < prev2.open &&
+    prev1.close < prev1.open &&
+    price < prev1.low
+  );
+
+  const isUptrend   = price > dynEma;
+  const isDowntrend = price < dynEma;
+  const emaUptrend  = emaShort > emaLong;
+  const emaDowntrend = emaShort < emaLong;
+  const returnedToTrend = distance < s.returnThreshold;
+
+  const longOk  = isUptrend && bullishReversal && returnedToTrend && speed > 0 && emaUptrend  && speed >= s.longSpeedMin;
+  const shortOk = isDowntrend && bearishReversal && returnedToTrend && speed < 0 && emaDowntrend && speed <= s.shortSpeedMax;
+
+  const direction = longOk ? "long" : (shortOk && CONFIG.allowShorts ? "short" : null);
+
   console.log("\n── Safety Check ─────────────────────────────────────────\n");
   console.log("  TREND FILTER\n");
 
-  // Rule 1 — price above EMA 200
   check(
-    "Price above EMA 200",
-    `> ${ema200.toFixed(4)}`,
-    price.toFixed(4),
-    price > ema200,
+    "EMA filter (EMA21 vs EMA50)",
+    longOk || !shortOk ? "EMA21 > EMA50 (uptrend)" : "EMA21 < EMA50 (downtrend)",
+    `EMA21: ${emaShort.toFixed(2)} / EMA50: ${emaLong.toFixed(2)}`,
+    longOk ? emaUptrend : emaDowntrend,
   );
 
-  // Rule 2 — EMA stack strictly ordered
-  const stackOk = ema8 > ema20 && ema20 > ema50 && ema50 > ema200;
   check(
-    "EMA stack: 8 > 20 > 50 > 200",
-    "strictly ordered",
-    `${ema8.toFixed(4)} / ${ema20.toFixed(4)} / ${ema50.toFixed(4)} / ${ema200.toFixed(4)}`,
-    stackOk,
+    "Price vs Dynamic EMA",
+    longOk || !shortOk ? "price > dynEMA" : "price < dynEMA",
+    `price: ${price.toFixed(2)} | dynEMA: ${dynEma.toFixed(2)}`,
+    longOk ? isUptrend : isDowntrend,
   );
 
-  // Rule 3 — all EMAs sloping upward
-  const s8   = isEMASloping(closes, 8);
-  const s20  = isEMASloping(closes, 20);
-  const s50  = isEMASloping(closes, 50);
-  const s200 = isEMASloping(closes, 200);
+  console.log("\n  ENTRY CONDITIONS\n");
+
   check(
-    "All EMAs sloping upward",
-    "all rising",
-    `EMA8:${s8 ? "↑" : "↓"} EMA20:${s20 ? "↑" : "↓"} EMA50:${s50 ? "↑" : "↓"} EMA200:${s200 ? "↑" : "↓"}`,
-    s8 && s20 && s50 && s200,
+    "Returned to Dynamic EMA",
+    `distance < ${s.returnThreshold}%`,
+    `${distance.toFixed(2)}%`,
+    returnedToTrend,
   );
 
-  console.log("\n  PULLBACK CONDITIONS\n");
-
-  const pb = analyzePullback(candles, ema20Series);
-
-  // Rule 5 — price at or within 1% of EMA 20
-  const distPct = Math.abs((price - ema20) / ema20) * 100;
   check(
-    "Price at / within 1% of EMA 20",
-    "≤ 1%",
-    `${distPct.toFixed(2)}% from EMA 20 ($${ema20.toFixed(4)})`,
-    distPct <= 1.0,
+    "Candle reversal pattern",
+    longOk || !shortOk
+      ? "2 consecutive green candles + close > prior high"
+      : "2 consecutive red candles + close < prior low",
+    longOk || !shortOk
+      ? `prev2Green:${prev2.close > prev2.open} prev1Green:${prev1.close > prev1.open} breakHigh:${price > prev1.high}`
+      : `prev2Red:${prev2.close < prev2.open} prev1Red:${prev1.close < prev1.open} breakLow:${price < prev1.low}`,
+    longOk ? bullishReversal : bearishReversal,
   );
 
-  // Rule 6 — pullback depth 5–15% from swing high
   check(
-    "Pullback depth 5–15% from swing high",
-    "5% ≤ depth ≤ 15%",
-    pb.depth !== null
-      ? `${pb.depth.toFixed(1)}% from swing high $${pb.swingHighPrice?.toFixed(4)}`
-      : "no swing high found in last 25 candles",
-    pb.depthValid,
+    "Speed filter (candle body in USD)",
+    longOk || !shortOk ? `>= $${s.longSpeedMin}` : `<= $${s.shortSpeedMax}`,
+    `$${speed.toFixed(2)}`,
+    longOk ? speed >= s.longSpeedMin : speed <= s.shortSpeedMax,
   );
 
-  // Rule 7 — pullback duration 3–7 candles
-  check(
-    "Pullback duration 3–7 candles",
-    "3 ≤ n ≤ 7",
-    pb.duration !== null ? `${pb.duration} candle${pb.duration === 1 ? "" : "s"}` : "no swing high found",
-    pb.durationValid,
-  );
+  const allPass = longOk || (shortOk && CONFIG.allowShorts);
 
-  // Rule 8 — price did not break through EMA 20 toward EMA 50
-  check(
-    "Trend intact — no close below EMA 20 during pullback",
-    "no breakdown",
-    pb.trendIntact ? "intact" : "⚠ price broke below EMA 20",
-    pb.trendIntact,
-  );
+  // Position sizing — risk 1% of portfolio, cap at maxTradeSizeUSD
+  const stopDist   = atr * s.atrMult;
+  const stopLevel  = direction === "long" ? price - stopDist : price + stopDist;
+  const tpLevel    = direction === "long"
+    ? price + price * s.fixedTpPct / 100
+    : price - price * s.fixedTpPct / 100;
 
-  console.log("\n  ENTRY TRIGGER\n");
-
-  // Rule 9 — bullish reversal candle (rule 10: waiting for candle close is implicit)
-  const reversal = detectReversalCandle(candles, ema20Series);
-  check(
-    "Bullish reversal candle at EMA 20",
-    "engulfing / hammer / shakeout",
-    reversal.detected ? reversal.type : "none detected",
-    reversal.detected,
-  );
-
-  console.log("\n  VOLUME CONFIRMATION\n");
-
-  // Rule 11 — reversal candle volume > avg pullback volume
-  const vol = pb.durationValid
-    ? checkVolumeConfirmation(candles, pb.duration)
-    : { passes: false, reversalVol: candles.at(-1)?.volume ?? 0, avgPullbackVol: 0 };
-  check(
-    "Reversal volume > avg pullback volume",
-    "reversal > pullback avg",
-    vol.reversalVol
-      ? `reversal: ${vol.reversalVol.toFixed(2)} | pullback avg: ${vol.avgPullbackVol.toFixed(2)}`
-      : "N/A — pullback duration invalid",
-    vol.passes,
-  );
-
-  // ── Position sizing ────────────────────────────────────────────────────────
-  // Stop = just below swing low of the pullback (Rule 16)
-  const stopLevel    = pb.swingLow ? pb.swingLow * 0.999 : price * 0.95;
-  const stopDistPct  = (price - stopLevel) / price;
-  const maxLoss      = CONFIG.portfolioValue * 0.01;           // Rule 13
-  const positionSize = stopDistPct > 0 ? maxLoss / stopDistPct : 0; // Rule 15
-  const tp1          = price + 2 * (price - stopLevel);        // Rule 17: 2× risk
-
-  const allPass = results.every((r) => r.pass);
+  const stopDistPct  = stopDist / price;
+  const maxLoss      = CONFIG.portfolioValue * 0.01;
+  const positionSize = stopDistPct > 0 ? maxLoss / stopDistPct : 0;
 
   if (allPass) {
     console.log("\n── Position Sizing ──────────────────────────────────────\n");
-    console.log(`  Account balance : $${CONFIG.portfolioValue.toFixed(2)}`);
-    console.log(`  Max loss (1%)   : $${maxLoss.toFixed(2)}`);
-    console.log(`  Entry price     : $${price.toFixed(4)}`);
-    console.log(`  Stop loss       : $${stopLevel.toFixed(4)} (swing low)`);
-    console.log(`  Risk distance   : ${(stopDistPct * 100).toFixed(2)}%`);
-    console.log(`  Position size   : $${positionSize.toFixed(2)} → capped at $${Math.min(positionSize, CONFIG.maxTradeSizeUSD).toFixed(2)}`);
-    console.log(`  TP1             : $${tp1.toFixed(4)} (2× risk — close 50%)`);
-    console.log(`  TP2             : Trail stop under EMA 8 on remaining 50%`);
+    console.log(`  Direction    : ${direction?.toUpperCase()}`);
+    console.log(`  Account      : $${CONFIG.portfolioValue.toFixed(2)}`);
+    console.log(`  Max loss (1%): $${maxLoss.toFixed(2)}`);
+    console.log(`  ATR          : $${atr.toFixed(2)}`);
+    console.log(`  Entry price  : $${price.toFixed(4)}`);
+    console.log(`  Stop loss    : $${stopLevel.toFixed(4)} (ATR × ${s.atrMult})`);
+    console.log(`  Take profit  : $${tpLevel.toFixed(4)} (${s.fixedTpPct}% fixed)`);
+    console.log(`  Risk distance: ${(stopDistPct * 100).toFixed(2)}%`);
+    console.log(`  Position size: $${positionSize.toFixed(2)} → capped at $${Math.min(positionSize, CONFIG.maxTradeSizeUSD).toFixed(2)}`);
   }
 
-  return { results, allPass, stopLevel, stopDistPct, positionSize, tp1, pb, reversal };
+  return { results, allPass, direction, stopLevel, tpLevel, stopDistPct, positionSize };
 }
 
 // ─── Exit Check ───────────────────────────────────────────────────────────────
 
-function checkExitConditions(position, candles, price, ema8, ema20) {
-  const closes = candles.map((c) => c.close);
-
-  // Rule 19 — 4H candle closes below EMA 20
-  if (price < ema20) {
-    return {
-      action: "stop",
-      reason: `Rule 19: closed below EMA 20 ($${price.toFixed(4)} < $${ema20.toFixed(4)})`,
-      closePercent: 1.0,
-    };
-  }
-
-  // Rule 20 — EMA 8 crosses below EMA 20
-  const ema8Prev  = calcEMA(closes.slice(0, -1), 8);
-  const ema20Prev = calcEMA(closes.slice(0, -1), 20);
-  if (ema8Prev && ema20Prev && ema8Prev > ema20Prev && ema8 <= ema20) {
-    return {
-      action: "stop",
-      reason: `Rule 20: EMA 8 crossed below EMA 20 (bearish crossover)`,
-      closePercent: 1.0,
-    };
-  }
-
-  // Rule 21 — close below original stop loss
-  if (price <= position.stopLevel) {
-    return {
-      action: "stop",
-      reason: `Rule 21: price $${price.toFixed(4)} ≤ stop $${position.stopLevel.toFixed(4)}`,
-      closePercent: 1.0,
-    };
-  }
-
-  // TP1 — entry + 2× risk, close 50% (Rule 17)
-  if (!position.tp1Hit && position.tp1Level && price >= position.tp1Level) {
-    return {
-      action: "tp1",
-      reason: `TP1: $${price.toFixed(4)} reached 2× risk target $${position.tp1Level.toFixed(4)}`,
-      closePercent: 0.50,
-    };
-  }
-
-  // TP2 — after TP1, trail remaining 50% under EMA 8 (Rule 18)
-  if (position.tp1Hit) {
-    const trailStop = ema8 * 0.999;
-    if (price <= trailStop) {
+function checkExitConditions(position, price) {
+  if (position.side === "buy") {
+    if (price >= position.tpLevel) {
       return {
-        action: "tp2",
-        reason: `TP2 trail: $${price.toFixed(4)} fell below EMA 8 trail stop $${trailStop.toFixed(4)}`,
+        action: "tp",
+        reason: `TP hit: $${price.toFixed(4)} ≥ $${position.tpLevel.toFixed(4)} (${CONFIG.strategy.fixedTpPct}%)`,
+        closePercent: 1.0,
+      };
+    }
+    if (price <= position.stopLevel) {
+      return {
+        action: "stop",
+        reason: `Stop hit: $${price.toFixed(4)} ≤ $${position.stopLevel.toFixed(4)} (ATR × ${CONFIG.strategy.atrMult})`,
+        closePercent: 1.0,
+      };
+    }
+  } else {
+    if (price <= position.tpLevel) {
+      return {
+        action: "tp",
+        reason: `TP hit: $${price.toFixed(4)} ≤ $${position.tpLevel.toFixed(4)} (${CONFIG.strategy.fixedTpPct}%)`,
+        closePercent: 1.0,
+      };
+    }
+    if (price >= position.stopLevel) {
+      return {
+        action: "stop",
+        reason: `Stop hit: $${price.toFixed(4)} ≥ $${position.stopLevel.toFixed(4)} (ATR × ${CONFIG.strategy.atrMult})`,
         closePercent: 1.0,
       };
     }
   }
-
   return { action: null, reason: null, closePercent: 0 };
 }
 
@@ -636,13 +561,14 @@ async function run() {
   checkOnboarding();
   await initCsv();
   console.log("═══════════════════════════════════════════════════════════");
-  console.log("  Claude Trading Bot — EMA Pullback Strategy");
+  console.log("  Claude Trading Bot — EMA Pullback Speed Strategy (PakunFX)");
   console.log(`  ${new Date().toISOString()}`);
   console.log(`  Mode: ${CONFIG.paperTrading ? "📋 PAPER TRADING" : "🔴 LIVE TRADING"}`);
+  console.log(`  Shorts: ${CONFIG.allowShorts ? "enabled (⚠️  requires Kraken margin)" : "disabled"}`);
   console.log("═══════════════════════════════════════════════════════════");
 
   const rules = JSON.parse(readFileSync("rules.json", "utf8"));
-  console.log(`\nStrategy : ${rules.strategy.name}`);
+  console.log(`\nStrategy : EMA Pullback Speed (PakunFX) — 4H`);
   console.log(`Watchlist: ${rules.watchlist.join(", ")} | Timeframe: ${CONFIG.timeframe}`);
 
   const log = loadLog();
@@ -667,20 +593,23 @@ async function processSymbol(symbol) {
 
   const closes = candles.map((c) => c.close);
   const price  = closes[closes.length - 1];
+  const s      = CONFIG.strategy;
 
-  const ema8   = calcEMA(closes, 8);
-  const ema20  = calcEMA(closes, 20);
-  const ema50  = calcEMA(closes, 50);
-  const ema200 = calcEMA(closes, 200);
-  const ema20Series = calcEMASeriesFull(closes, 20);
+  const emaShort   = calcEMA(closes, s.shortEmaLen);
+  const emaLong    = calcEMA(closes, s.longEmaLen);
+  const dynEmaFull = calcDynamicEMAFull(candles, s.maxLength, s.accelMultiplier);
+  const atrFull    = calcATRFull(candles, s.atrLength);
 
-  console.log(`  Price  : $${price.toFixed(4)}`);
-  console.log(`  EMA 8  : $${ema8   ? ema8.toFixed(4)   : "N/A"}`);
-  console.log(`  EMA 20 : $${ema20  ? ema20.toFixed(4)  : "N/A"}`);
-  console.log(`  EMA 50 : $${ema50  ? ema50.toFixed(4)  : "N/A"}`);
-  console.log(`  EMA 200: $${ema200 ? ema200.toFixed(4) : "N/A"}`);
+  const dynEma = dynEmaFull[dynEmaFull.length - 1];
+  const atr    = atrFull[atrFull.length - 1];
 
-  if (!ema8 || !ema20 || !ema50 || !ema200) {
+  console.log(`  Price    : $${price.toFixed(4)}`);
+  console.log(`  EMA ${s.shortEmaLen}   : $${emaShort ? emaShort.toFixed(4) : "N/A"}`);
+  console.log(`  EMA ${s.longEmaLen}   : $${emaLong  ? emaLong.toFixed(4)  : "N/A"}`);
+  console.log(`  Dyn EMA  : $${dynEma ? dynEma.toFixed(4) : "N/A"}`);
+  console.log(`  ATR(${s.atrLength})  : $${atr ? atr.toFixed(4) : "N/A"}`);
+
+  if (!emaShort || !emaLong || !dynEma || !atr) {
     console.log(`\n⚠️  Not enough candle data for ${symbol}. Skipping.`); return;
   }
 
@@ -690,38 +619,40 @@ async function processSymbol(symbol) {
 
   if (openPosition) {
     console.log(`\n── Open Position ─────────────────────────────────────────\n`);
+    console.log(`  Side      : ${openPosition.side === "buy" ? "LONG" : "SHORT"}`);
     console.log(`  Entry     : $${openPosition.entryPrice.toFixed(4)}`);
-    console.log(`  Remaining : $${openPosition.remainingSize.toFixed(2)} of $${openPosition.initialSize.toFixed(2)}`);
+    console.log(`  Size      : $${openPosition.remainingSize.toFixed(2)}`);
     console.log(`  Stop      : $${openPosition.stopLevel.toFixed(4)}`);
-    if (openPosition.tp1Level) console.log(`  TP1       : $${openPosition.tp1Level.toFixed(4)}${openPosition.tp1Hit ? " ✅ hit" : ""}`);
-    if (openPosition.tp1Hit)   console.log(`  TP2       : Trailing EMA 8 (current stop $${(ema8 * 0.999).toFixed(4)})`);
+    console.log(`  TP        : $${openPosition.tpLevel.toFixed(4)}`);
 
-    const exitResult = checkExitConditions(openPosition, candles, price, ema8, ema20);
+    const exitResult = checkExitConditions(openPosition, price);
 
     if (exitResult.action) {
       const closeSize = openPosition.remainingSize * exitResult.closePercent;
-      const pnl = (((price - openPosition.entryPrice) / openPosition.entryPrice) * 100).toFixed(3);
+      const pnlPct    = (((price - openPosition.entryPrice) / openPosition.entryPrice) * 100).toFixed(3);
+      const exitSide  = openPosition.side === "buy" ? "sell" : "buy";
+
       console.log(`\n🔔 ${exitResult.action.toUpperCase()}: ${exitResult.reason}`);
-      console.log(`   Closing $${closeSize.toFixed(2)} | P&L: ${pnl}%`);
+      console.log(`   Closing $${closeSize.toFixed(2)} | P&L: ${pnlPct}%`);
 
       let orderId = null, orderPlaced = false;
       if (CONFIG.paperTrading) {
-        console.log(`\n📋 PAPER SELL — $${closeSize.toFixed(2)} of ${symbol} at $${price.toFixed(4)}`);
+        console.log(`\n📋 PAPER ${exitSide.toUpperCase()} — $${closeSize.toFixed(2)} of ${symbol} at $${price.toFixed(4)}`);
         orderId = `PAPER-${exitResult.action.toUpperCase()}-${Date.now()}`;
         orderPlaced = true;
       } else {
         try {
-          const order = await placeKrakenOrder(symbol, "sell", closeSize, price);
+          const order = await placeKrakenOrder(symbol, exitSide, closeSize, price);
           orderId = order.orderId; orderPlaced = true;
-          console.log(`✅ SELL ORDER PLACED — ${orderId}`);
-        } catch (err) { console.log(`❌ SELL ORDER FAILED — ${err.message}`); }
+          console.log(`✅ ${exitSide.toUpperCase()} ORDER PLACED — ${orderId}`);
+        } catch (err) { console.log(`❌ ${exitSide.toUpperCase()} ORDER FAILED — ${err.message}`); }
       }
 
       const log = loadLog();
       const closeEntry = {
-        timestamp: new Date().toISOString(), symbol, side: "sell",
+        timestamp: new Date().toISOString(), symbol, side: exitSide,
         timeframe: CONFIG.timeframe, price,
-        indicators: { ema8, ema20, ema50, ema200 },
+        indicators: { emaShort, emaLong, dynEma, atr },
         conditions: [], allPass: true, tradeSize: closeSize, orderPlaced,
         orderId: orderId || `FAILED-${Date.now()}`,
         paperTrading: CONFIG.paperTrading, exitReason: exitResult.reason,
@@ -731,40 +662,30 @@ async function processSymbol(symbol) {
       saveLog(log);
       await writeTrade(closeEntry);
 
-      if (exitResult.action === "tp1") {
-        positions[symbol] = {
-          ...openPosition,
-          tp1Hit: true,
-          remainingSize: openPosition.remainingSize - closeSize,
-          stopMode: "trailing_ema8",
-        };
-        console.log(`   Remaining $${positions[symbol].remainingSize.toFixed(2)} — now trailing EMA 8`);
-        await savePositions(positions);
-      } else {
-        delete positions[symbol];
-        await savePositions(positions);
-        console.log(`   Position fully closed.`);
-      }
+      delete positions[symbol];
+      await savePositions(positions);
+      console.log(`   Position closed.`);
     } else {
-      console.log(`\n  Holding — no exit condition met.`);
-      if (openPosition.tp1Hit) console.log(`  EMA 8 trail stop: $${(ema8 * 0.999).toFixed(4)}`);
+      const pnlPct = (((price - openPosition.entryPrice) / openPosition.entryPrice) * 100).toFixed(3);
+      console.log(`\n  Holding — no exit condition met. Current P&L: ${pnlPct}%`);
     }
     return;
   }
 
   // ── No open position — evaluate entry ─────────────────────────────────────
-  const { results, allPass, stopLevel, stopDistPct, positionSize, tp1 } =
-    runSafetyCheck(candles, price, ema8, ema20, ema50, ema200, ema20Series);
+  const { results, allPass, direction, stopLevel, tpLevel, stopDistPct, positionSize } =
+    runSafetyCheck(candles, price, emaShort, emaLong, dynEmaFull, atrFull);
 
   const tradeSize = Math.min(positionSize, CONFIG.maxTradeSizeUSD);
+  const entrySide = direction === "long" ? "buy" : "sell";
 
   console.log("\n── Decision ─────────────────────────────────────────────\n");
 
   const log = loadLog();
   const logEntry = {
-    timestamp: new Date().toISOString(), symbol, side: "buy",
+    timestamp: new Date().toISOString(), symbol, side: entrySide,
     timeframe: CONFIG.timeframe, price,
-    indicators: { ema8, ema20, ema50, ema200 },
+    indicators: { emaShort, emaLong, dynEma, atr },
     conditions: results, allPass, tradeSize,
     orderPlaced: false, orderId: null,
     paperTrading: CONFIG.paperTrading,
@@ -780,16 +701,16 @@ async function processSymbol(symbol) {
     console.log(`🚫 TRADE BLOCKED`);
     failed.forEach((f) => console.log(`   - ${f}`));
   } else {
-    console.log(`✅ ALL CONDITIONS MET`);
+    console.log(`✅ ALL CONDITIONS MET — ${direction?.toUpperCase()}`);
     if (CONFIG.paperTrading) {
-      console.log(`\n📋 PAPER TRADE — buy ${symbol} ~$${tradeSize.toFixed(2)} at market`);
+      console.log(`\n📋 PAPER TRADE — ${entrySide} ${symbol} ~$${tradeSize.toFixed(2)} at market`);
       console.log(`   (Set PAPER_TRADING=false in .env to place real orders)`);
       logEntry.orderPlaced = true;
       logEntry.orderId = `PAPER-${Date.now()}`;
     } else {
-      console.log(`\n🔴 PLACING LIVE ORDER — $${tradeSize.toFixed(2)} BUY ${symbol}`);
+      console.log(`\n🔴 PLACING LIVE ORDER — $${tradeSize.toFixed(2)} ${entrySide.toUpperCase()} ${symbol}`);
       try {
-        const order = await placeKrakenOrder(symbol, "buy", tradeSize, price);
+        const order = await placeKrakenOrder(symbol, entrySide, tradeSize, price);
         logEntry.orderPlaced = true; logEntry.orderId = order.orderId;
         console.log(`✅ ORDER PLACED — ${order.orderId}`);
       } catch (err) {
@@ -800,11 +721,15 @@ async function processSymbol(symbol) {
 
     if (logEntry.orderPlaced) {
       positions[symbol] = {
-        symbol, side: "buy", entryPrice: price,
-        stopLevel, stopMode: "initial",
-        tp1Level: tp1, tp1Hit: false,
-        initialSize: tradeSize, remainingSize: tradeSize,
-        entryTime: logEntry.timestamp, orderId: logEntry.orderId,
+        symbol,
+        side: entrySide,
+        entryPrice: price,
+        stopLevel,
+        tpLevel,
+        initialSize: tradeSize,
+        remainingSize: tradeSize,
+        entryTime: logEntry.timestamp,
+        orderId: logEntry.orderId,
         paperTrading: CONFIG.paperTrading,
       };
       await savePositions(positions);
