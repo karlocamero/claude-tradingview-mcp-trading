@@ -45,7 +45,7 @@ function checkOnboarding() {
         "FIXED_TP_PCT=3.0",
         "SHORT_EMA_LEN=21",
         "LONG_EMA_LEN=50",
-        "LONG_SPEED_MIN=1000",
+        "LONG_SPEED_MIN=800",
         "SHORT_SPEED_MAX=-1000",
         "",
         "# Google Sheets (required for Railway — trades + position persistence)",
@@ -65,34 +65,34 @@ function checkOnboarding() {
 // ─── Config ──────────────────────────────────────────────────────────────────
 
 const CONFIG = {
-  timeframe:       process.env.TIMEFRAME || "4H",
-  portfolioValue:  parseFloat(process.env.PORTFOLIO_VALUE_USD || "1000"),
-  maxTradeSizeUSD: parseFloat(process.env.MAX_TRADE_SIZE_USD  || "100"),
-  maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY    || "3"),
-  paperTrading:    process.env.PAPER_TRADING !== "false",
-  allowShorts:     process.env.ALLOW_SHORTS === "true",
+  timeframe: process.env.TIMEFRAME || "4H",
+  portfolioValue: parseFloat(process.env.PORTFOLIO_VALUE_USD || "1000"),
+  maxTradeSizeUSD: parseFloat(process.env.MAX_TRADE_SIZE_USD || "100"),
+  maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY || "3"),
+  paperTrading: process.env.PAPER_TRADING !== "false",
+  allowShorts: process.env.ALLOW_SHORTS === "true",
   strategy: {
-    maxLength:       parseInt(process.env.DYN_EMA_MAX_LENGTH || "50"),
-    accelMultiplier: parseFloat(process.env.ACCEL_MULTIPLIER  || "3.0"),
-    returnThreshold: parseFloat(process.env.RETURN_THRESHOLD  || "5.0"),
-    atrLength:       parseInt(process.env.ATR_LENGTH          || "14"),
-    atrMult:         parseFloat(process.env.ATR_MULT          || "4.0"),
-    fixedTpPct:      parseFloat(process.env.FIXED_TP_PCT      || "1.5"),
-    shortEmaLen:     parseInt(process.env.SHORT_EMA_LEN       || "21"),
-    longEmaLen:      parseInt(process.env.LONG_EMA_LEN        || "50"),
-    longSpeedMin:    parseFloat(process.env.LONG_SPEED_MIN    || "1000"),
-    shortSpeedMax:   parseFloat(process.env.SHORT_SPEED_MAX   || "-1000"),
+    maxLength: parseInt(process.env.DYN_EMA_MAX_LENGTH || "50"),
+    accelMultiplier: parseFloat(process.env.ACCEL_MULTIPLIER || "3.0"),
+    returnThreshold: parseFloat(process.env.RETURN_THRESHOLD || "5.0"),
+    atrLength: parseInt(process.env.ATR_LENGTH || "14"),
+    atrMult: parseFloat(process.env.ATR_MULT || "4.0"),
+    fixedTpPct: parseFloat(process.env.FIXED_TP_PCT || "3.0"),
+    shortEmaLen: parseInt(process.env.SHORT_EMA_LEN || "21"),
+    longEmaLen: parseInt(process.env.LONG_EMA_LEN || "50"),
+    longSpeedMin: parseFloat(process.env.LONG_SPEED_MIN || "800"),
+    shortSpeedMax: parseFloat(process.env.SHORT_SPEED_MAX || "-1000"),
   },
   kraken: {
-    apiKey:    process.env.KRAKEN_API_KEY,
+    apiKey: process.env.KRAKEN_API_KEY,
     secretKey: process.env.KRAKEN_SECRET_KEY,
-    baseUrl:   "https://api.kraken.com",
+    baseUrl: "https://api.kraken.com",
   },
 };
 
-const LOG_FILE       = "safety-check-log.json";
+const LOG_FILE = "safety-check-log.json";
 const POSITIONS_FILE = "positions.json";
-const CSV_FILE       = "trades.csv";
+const CSV_FILE = "trades.csv";
 const CSV_HEADER_ROW = [
   "Date", "Time (UTC)", "Exchange", "Symbol", "Side",
   "Quantity", "Price", "Total USD", "Fee (est. 0.4%)",
@@ -124,7 +124,7 @@ async function getSheetClient() {
   const auth = new google.auth.GoogleAuth({
     credentials: {
       client_email: process.env.GOOGLE_CLIENT_EMAIL,
-      private_key:  process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, "\n"),
+      private_key: process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, "\n"),
     },
     scopes: ["https://www.googleapis.com/auth/spreadsheets"],
   });
@@ -208,11 +208,11 @@ async function fetchCandles(symbol, interval, limit = 720) {
   const pairData = Object.values(data.result).find((v) => Array.isArray(v));
   if (!pairData?.length) throw new Error(`No candle data returned for ${symbol}`);
   return pairData.slice(-limit).map((k) => ({
-    time:   k[0] * 1000,
-    open:   parseFloat(k[1]),
-    high:   parseFloat(k[2]),
-    low:    parseFloat(k[3]),
-    close:  parseFloat(k[4]),
+    time: k[0] * 1000,
+    open: parseFloat(k[1]),
+    high: parseFloat(k[2]),
+    low: parseFloat(k[3]),
+    close: parseFloat(k[4]),
     volume: parseFloat(k[6]),
   }));
 }
@@ -237,24 +237,24 @@ function calcDynamicEMAFull(candles, maxLength = 50, accelMultiplier = 3.0) {
 
   for (let i = 0; i < n; i++) {
     const wStart = Math.max(0, i - 199);
-    const window  = closes.slice(wStart, i + 1);
+    const window = closes.slice(wStart, i + 1);
 
     // Normalise current close within its 200-bar range (0.5 – 1.0)
-    const maxClose        = Math.max(...window);
-    const countsDiffNorm  = maxClose === 0 ? 0.5 : (closes[i] + maxClose) / (2 * maxClose);
-    const dynLength       = 5 + countsDiffNorm * (maxLength - 5);
+    const maxClose = Math.max(...window);
+    const countsDiffNorm = maxClose === 0 ? 0.5 : (closes[i] + maxClose) / (2 * maxClose);
+    const dynLength = 5 + countsDiffNorm * (maxLength - 5);
 
     // Acceleration factor: how fast price is changing vs its own recent history
     const deltas = [];
     for (let j = Math.max(1, wStart); j <= i; j++) {
       deltas.push(Math.abs(closes[j] - closes[j - 1]));
     }
-    const delta      = i > 0 ? Math.abs(closes[i] - closes[i - 1]) : 0;
-    const maxDelta   = deltas.length > 0 ? Math.max(...deltas) : 1;
+    const delta = i > 0 ? Math.abs(closes[i] - closes[i - 1]) : 0;
+    const maxDelta = deltas.length > 0 ? Math.max(...deltas) : 1;
     const accelFactor = maxDelta === 0 ? 0 : delta / maxDelta;
 
     const alphaBase = 2 / (dynLength + 1);
-    const alpha     = Math.min(1, alphaBase * (1 + accelFactor * accelMultiplier));
+    const alpha = Math.min(1, alphaBase * (1 + accelFactor * accelMultiplier));
 
     dynEma = dynEma === null ? closes[i] : alpha * closes[i] + (1 - alpha) * dynEma;
     result.push(dynEma);
@@ -274,7 +274,7 @@ function calcATRFull(candles, period = 14) {
     const tr = Math.max(
       candles[i].high - candles[i].low,
       Math.abs(candles[i].high - candles[i - 1].close),
-      Math.abs(candles[i].low  - candles[i - 1].close),
+      Math.abs(candles[i].low - candles[i - 1].close),
     );
     rma = rma === null ? tr : tr * k + rma * (1 - k);
     result[i] = rma;
@@ -287,10 +287,10 @@ function calcATRFull(candles, period = 14) {
 
 function runSafetyCheck(candles, price, emaShort, emaLong, dynEmaFull, atrFull) {
   const results = [];
-  const n       = candles.length;
-  const dynEma  = dynEmaFull[n - 1];
-  const atr     = atrFull[n - 1];
-  const s       = CONFIG.strategy;
+  const n = candles.length;
+  const dynEma = dynEmaFull[n - 1];
+  const atr = atrFull[n - 1];
+  const s = CONFIG.strategy;
 
   if (!dynEma || !atr) return { results, allPass: false, direction: null };
 
@@ -301,10 +301,10 @@ function runSafetyCheck(candles, price, emaShort, emaLong, dynEmaFull, atrFull) 
   };
 
   // Speed = candle body in USD (close − open)
-  const curr     = candles[n - 1];
-  const prev1    = candles[n - 2];
-  const prev2    = candles[n - 3];
-  const speed    = curr.close - curr.open;
+  const curr = candles[n - 1];
+  const prev1 = candles[n - 2];
+  const prev2 = candles[n - 3];
+  const speed = curr.close - curr.open;
   const distance = Math.abs(price - dynEma) / dynEma * 100;
 
   // Candle pattern: two consecutive green candles then current breaks above prior high
@@ -321,13 +321,13 @@ function runSafetyCheck(candles, price, emaShort, emaLong, dynEmaFull, atrFull) 
     price < prev1.low
   );
 
-  const isUptrend   = price > dynEma;
+  const isUptrend = price > dynEma;
   const isDowntrend = price < dynEma;
-  const emaUptrend  = emaShort > emaLong;
+  const emaUptrend = emaShort > emaLong;
   const emaDowntrend = emaShort < emaLong;
   const returnedToTrend = distance < s.returnThreshold;
 
-  const longOk  = isUptrend && bullishReversal && returnedToTrend && speed > 0 && emaUptrend  && speed >= s.longSpeedMin;
+  const longOk = isUptrend && bullishReversal && returnedToTrend && emaUptrend && speed >= s.longSpeedMin;
   const shortOk = isDowntrend && bearishReversal && returnedToTrend && speed < 0 && emaDowntrend && speed <= s.shortSpeedMax;
 
   const direction = longOk ? "long" : (shortOk && CONFIG.allowShorts ? "short" : null);
@@ -379,14 +379,14 @@ function runSafetyCheck(candles, price, emaShort, emaLong, dynEmaFull, atrFull) 
   const allPass = longOk || (shortOk && CONFIG.allowShorts);
 
   // Position sizing — risk 1% of portfolio, cap at maxTradeSizeUSD
-  const stopDist   = atr * s.atrMult;
-  const stopLevel  = direction === "long" ? price - stopDist : price + stopDist;
-  const tpLevel    = direction === "long"
+  const stopDist = atr * s.atrMult;
+  const stopLevel = direction === "long" ? price - stopDist : price + stopDist;
+  const tpLevel = direction === "long"
     ? price + price * s.fixedTpPct / 100
     : price - price * s.fixedTpPct / 100;
 
-  const stopDistPct  = stopDist / price;
-  const maxLoss      = CONFIG.portfolioValue * 0.01;
+  const stopDistPct = stopDist / price;
+  const maxLoss = CONFIG.portfolioValue * 0.01;
   const positionSize = stopDistPct > 0 ? maxLoss / stopDistPct : 0;
 
   if (allPass) {
@@ -467,12 +467,13 @@ function signKraken(path, nonce, encodedBody) {
 }
 
 async function placeKrakenOrder(symbol, side, sizeUSD, price) {
-  const quantity    = (sizeUSD / price).toFixed(8);
-  const nonce       = Date.now() * 1000;
-  const path        = "/0/private/AddOrder";
-  const params      = new URLSearchParams({ nonce: nonce.toString(), ordertype: "market", type: side, volume: quantity, pair: symbol });
+  const quantity = (sizeUSD / price).toFixed(8);
+  if (parseFloat(quantity) < 0.0001) throw new Error(`Order too small: ${quantity} BTC (Kraken minimum is 0.0001)`);
+  const nonce = Date.now() * 1000;
+  const path = "/0/private/AddOrder";
+  const params = new URLSearchParams({ nonce: nonce.toString(), ordertype: "market", type: side, volume: quantity, pair: symbol });
   const encodedBody = params.toString();
-  const signature   = signKraken(path, nonce, encodedBody);
+  const signature = signKraken(path, nonce, encodedBody);
   const res = await fetch(`${CONFIG.kraken.baseUrl}${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded", "API-Key": CONFIG.kraken.apiKey, "API-Sign": signature },
@@ -500,7 +501,7 @@ async function initCsv() {
 }
 
 async function writeTrade(logEntry) {
-  const now  = new Date(logEntry.timestamp);
+  const now = new Date(logEntry.timestamp);
   const date = now.toISOString().slice(0, 10);
   const time = now.toISOString().slice(11, 19);
 
@@ -510,13 +511,13 @@ async function writeTrade(logEntry) {
     const failed = logEntry.conditions.filter((c) => !c.pass).map((c) => c.label).join("; ");
     mode = "BLOCKED"; orderId = "BLOCKED"; notes = `Failed: ${failed}`;
   } else {
-    quantity  = (logEntry.tradeSize / logEntry.price).toFixed(6);
-    totalUSD  = logEntry.tradeSize.toFixed(2);
-    fee       = (logEntry.tradeSize * 0.004).toFixed(4);
+    quantity = (logEntry.tradeSize / logEntry.price).toFixed(6);
+    totalUSD = logEntry.tradeSize.toFixed(2);
+    fee = (logEntry.tradeSize * 0.004).toFixed(4);
     netAmount = (logEntry.tradeSize - parseFloat(fee)).toFixed(2);
-    orderId   = logEntry.orderId || "";
-    mode      = logEntry.paperTrading ? "PAPER" : "LIVE";
-    notes     = logEntry.error ? `Error: ${logEntry.error}` : logEntry.exitReason || "All conditions met";
+    orderId = logEntry.orderId || "";
+    mode = logEntry.paperTrading ? "PAPER" : "LIVE";
+    notes = logEntry.error ? `Error: ${logEntry.error}` : logEntry.exitReason || "All conditions met";
   }
 
   const rowValues = [
@@ -537,13 +538,13 @@ async function writeTrade(logEntry) {
 
 function generateTaxSummary() {
   if (!existsSync(CSV_FILE)) { console.log("No trades.csv found."); return; }
-  const lines   = readFileSync(CSV_FILE, "utf8").trim().split("\n");
-  const rows    = lines.slice(1).map((l) => l.split(","));
-  const live    = rows.filter((r) => r[11] === "LIVE");
-  const paper   = rows.filter((r) => r[11] === "PAPER");
+  const lines = readFileSync(CSV_FILE, "utf8").trim().split("\n");
+  const rows = lines.slice(1).map((l) => l.split(","));
+  const live = rows.filter((r) => r[11] === "LIVE");
+  const paper = rows.filter((r) => r[11] === "PAPER");
   const blocked = rows.filter((r) => r[11] === "BLOCKED");
   const totalVolume = live.reduce((s, r) => s + parseFloat(r[7] || 0), 0);
-  const totalFees   = live.reduce((s, r) => s + parseFloat(r[8] || 0), 0);
+  const totalFees = live.reduce((s, r) => s + parseFloat(r[8] || 0), 0);
   console.log("\n── Tax Summary ──────────────────────────────────────────\n");
   console.log(`  Total decisions : ${rows.length}`);
   console.log(`  Live trades     : ${live.length}`);
@@ -592,20 +593,20 @@ async function processSymbol(symbol) {
   catch (err) { console.log(`⚠️  Skipping ${symbol} — ${err.message}`); return; }
 
   const closes = candles.map((c) => c.close);
-  const price  = closes[closes.length - 1];
-  const s      = CONFIG.strategy;
+  const price = closes[closes.length - 1];
+  const s = CONFIG.strategy;
 
-  const emaShort   = calcEMA(closes, s.shortEmaLen);
-  const emaLong    = calcEMA(closes, s.longEmaLen);
+  const emaShort = calcEMA(closes, s.shortEmaLen);
+  const emaLong = calcEMA(closes, s.longEmaLen);
   const dynEmaFull = calcDynamicEMAFull(candles, s.maxLength, s.accelMultiplier);
-  const atrFull    = calcATRFull(candles, s.atrLength);
+  const atrFull = calcATRFull(candles, s.atrLength);
 
   const dynEma = dynEmaFull[dynEmaFull.length - 1];
-  const atr    = atrFull[atrFull.length - 1];
+  const atr = atrFull[atrFull.length - 1];
 
   console.log(`  Price    : $${price.toFixed(4)}`);
   console.log(`  EMA ${s.shortEmaLen}   : $${emaShort ? emaShort.toFixed(4) : "N/A"}`);
-  console.log(`  EMA ${s.longEmaLen}   : $${emaLong  ? emaLong.toFixed(4)  : "N/A"}`);
+  console.log(`  EMA ${s.longEmaLen}   : $${emaLong ? emaLong.toFixed(4) : "N/A"}`);
   console.log(`  Dyn EMA  : $${dynEma ? dynEma.toFixed(4) : "N/A"}`);
   console.log(`  ATR(${s.atrLength})  : $${atr ? atr.toFixed(4) : "N/A"}`);
 
@@ -614,7 +615,7 @@ async function processSymbol(symbol) {
   }
 
   // ── Check open position first ──────────────────────────────────────────────
-  const positions    = await loadPositions();
+  const positions = await loadPositions();
   const openPosition = positions[symbol];
 
   if (openPosition) {
@@ -629,8 +630,8 @@ async function processSymbol(symbol) {
 
     if (exitResult.action) {
       const closeSize = openPosition.remainingSize * exitResult.closePercent;
-      const pnlPct    = (((price - openPosition.entryPrice) / openPosition.entryPrice) * 100).toFixed(3);
-      const exitSide  = openPosition.side === "buy" ? "sell" : "buy";
+      const pnlPct = (((price - openPosition.entryPrice) / openPosition.entryPrice) * 100).toFixed(3);
+      const exitSide = openPosition.side === "buy" ? "sell" : "buy";
 
       console.log(`\n🔔 ${exitResult.action.toUpperCase()}: ${exitResult.reason}`);
       console.log(`   Closing $${closeSize.toFixed(2)} | P&L: ${pnlPct}%`);
@@ -677,7 +678,7 @@ async function processSymbol(symbol) {
     runSafetyCheck(candles, price, emaShort, emaLong, dynEmaFull, atrFull);
 
   const tradeSize = Math.min(positionSize, CONFIG.maxTradeSizeUSD);
-  const entrySide = direction === "long" ? "buy" : "sell";
+  const entrySide = direction === "short" ? "sell" : "buy";
 
   console.log("\n── Decision ─────────────────────────────────────────────\n");
 
