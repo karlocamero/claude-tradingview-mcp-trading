@@ -663,9 +663,13 @@ async function processSymbol(symbol) {
       saveLog(log);
       await writeTrade(closeEntry);
 
-      delete positions[symbol];
-      await savePositions(positions);
-      console.log(`   Position closed.`);
+      if (orderPlaced) {
+        delete positions[symbol];
+        await savePositions(positions);
+        console.log(`   Position closed.`);
+      } else {
+        console.log(`   ⚠️  Exit order failed — position retained, will retry next run.`);
+      }
     } else {
       const pnlPct = (((price - openPosition.entryPrice) / openPosition.entryPrice) * 100).toFixed(3);
       console.log(`\n  Holding — no exit condition met. Current P&L: ${pnlPct}%`);
